@@ -4,6 +4,7 @@ import sqlite3
 import plotly.graph_objects as go
 import unicodedata
 import re
+import io
 
 DB_NAME = 'dados_gestao_integrada.db'
 st.set_page_config(page_title="FIPLAN - GESTAO INTEGRADA", layout="wide")
@@ -27,6 +28,15 @@ CATEGORIAS_REC = [
     "Receita Tributaria", "Receita Patrimonial", "Receita de Servicos",
     "Receita Corrente", "Demais Receitas"
 ]
+
+BIMESTRES = {
+    "1 Bimestre (Jan-Fev)": [1, 2],
+    "2 Bimestre (Mar-Abr)": [3, 4],
+    "3 Bimestre (Mai-Jun)": [5, 6],
+    "4 Bimestre (Jul-Ago)": [7, 8],
+    "5 Bimestre (Set-Out)": [9, 10],
+    "6 Bimestre (Nov-Dez)": [11, 12]
+}
 
 st.markdown(
     "<style>[data-testid='stMetricValue']"
@@ -83,6 +93,13 @@ def norm(v):
     except Exception:
         pass
     return s
+
+
+def gerar_excel_lrf(df_final):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df_final.to_excel(writer, index=False, sheet_name="Anexo_LRF")
+    return output.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +539,7 @@ df_exec = pd.read_sql("SELECT * FROM execucao",      conn_main)
 df_sub  = pd.read_sql("SELECT * FROM sub_elementos", conn_main)
 conn_main.close()
 
-tab1, tab2, tab3 = st.tabs(["Receitas", "Despesas", "Comparativo"])
+tab1, tab2, tab3, tab4 = st.tabs(["Receitas", "Despesas", "Comparativo", "Relatorios LRF"])
 
 
 # ---------------------------------------------------------------------------
@@ -918,3 +935,98 @@ with tab3:
             height=400, barmode="group", margin=dict(l=0, r=0, t=30, b=0)
         )
         st.plotly_chart(fig_c, width='stretch')
+
+
+# ---------------------------------------------------------------------------
+# ABA 4: RELATORIOS LRF
+# ---------------------------------------------------------------------------
+with tab4:
+    st.subheader("Anexos LRF")
+    if df_rec.empty and df_exec.empty:
+        st.info("Importe dados de Receita e Execucao para gerar os anexos.")
+    else:
+        bim = st.selectbox("Bimestre de referencia:", list(BIMESTRES.keys()), key="bim_lrf")
+        m_ac = list(range(1, max(BIMESTRES[bim]) + 1))
+
+        c1, c2, c3 = st.columns(3)
+
+        # Anexo I — Receitas por categoria/natureza
+        if not df_rec.empty:
+            df_a1 = (
+                df_rec[df_rec["mes"].isin(m_ac)]
+                .groupby(["categoria", "natureza"])
+                .agg(orcado=("orcado", "max"), realizado=("realizado", "sum"))
+                .reset_index()
+            )
+            c1.write("**Anexo I — Receitas**")
+            c1.dataframe(
+                df_a1.style.format({"orcado": "{:,.2f}", "realizado": "{:,.2f}"}),
+                width="stretch"
+            )
+            c1.download_button(
+                "Baixar Anexo I",
+                data=gerar_excel_lrf(df_a1),
+                file_name="AnexoI.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="lrf1"
+            )
+
+        # Anexo IA — Despesas por natureza (execucao + cred. autorizado do orcamento)
+        if not df_exec.empty:
+            df_exec_ac = df_exec[df_exec["mes"].isin(m_ac)]
+            df_a1a_exec = (
+                df_exec_ac
+                .groupby("natureza")
+                .agg(empenhado=("empenhado", "sum"),
+                     liquidado=("liquidado", "sum"),
+                     pago=("pago", "sum"))
+                .reset_index()
+            )
+            if not df_orc.empty:
+                m_max_orc = int(df_orc["mes"].max())
+                df_orc_nat = (
+                    df_orc[df_orc["mes"] == m_max_orc]
+                    .groupby("natureza")
+                    .agg(cred_autorizado=("cred_autorizado", "sum"))
+                    .reset_index()
+                )
+                df_a1a = df_a1a_exec.merge(df_orc_nat, on="natureza", how="left").fillna(0)
+                cols_a1a = ["natureza", "cred_autorizado", "empenhado", "liquidado", "pago"]
+            else:
+                df_a1a = df_a1a_exec
+                cols_a1a = ["natureza", "empenhado", "liquidado", "pago"]
+
+            c2.write("**Anexo IA — Despesas por Natureza**")
+            c2.dataframe(
+                df_a1a[cols_a1a].style.format({c: "{:,.2f}" for c in cols_a1a if c != "natureza"}),
+                width="stretch"
+            )
+            c2.download_button(
+                "Baixar Anexo IA",
+                data=gerar_excel_lrf(df_a1a[cols_a1a]),
+                file_name="AnexoIA.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="lrf1a"
+            )
+
+            # Anexo II — Despesas por funcao/subfuncao
+            df_a2 = (
+                df_exec_ac
+                .groupby(["funcao", "subfuncao"])
+                .agg(empenhado=("empenhado", "sum"),
+                     liquidado=("liquidado", "sum"),
+                     pago=("pago", "sum"))
+                .reset_index()
+            )
+            c3.write("**Anexo II — Despesas por Funcao**")
+            c3.dataframe(
+                df_a2.style.format({"empenhado": "{:,.2f}", "liquidado": "{:,.2f}", "pago": "{:,.2f}"}),
+                width="stretch"
+            )
+            c3.download_button(
+                "Baixar Anexo II",
+                data=gerar_excel_lrf(df_a2),
+                file_name="AnexoII.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="lrf2"
+            )
