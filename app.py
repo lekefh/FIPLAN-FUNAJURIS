@@ -5,9 +5,21 @@ import plotly.graph_objects as go
 import unicodedata
 import re
 import io
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from reportlab.lib import colors as rl_c
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
+                                 Paragraph, Spacer, Image as RLImage,
+                                 HRFlowable)
+from reportlab.lib.enums import TA_CENTER
 
 DB_NAME = 'dados_gestao_integrada.db'
-st.set_page_config(page_title="FIPLAN - GESTAO INTEGRADA", layout="wide")
+st.set_page_config(page_title="FIPLAN - FUNAJURIS", layout="wide")
 st.markdown(
     "<h2 style='text-align:center;margin-bottom:0'>UO 03601 - FUNAJURIS</h2>"
     "<p style='text-align:center;color:#888;margin-top:0'>"
@@ -420,10 +432,460 @@ def gerar_excel_anexo2(df_orc, df_exec, meses_bim, meses_ate_agora):
 
 
 # ---------------------------------------------------------------------------
+# CORES
+# ---------------------------------------------------------------------------
+COR_AZUL  = "#1B3A6B"
+COR_VERDE = "#2E7D32"
+COR_LARAN = "#E65100"
+COR_CINZA = "#F5F7FA"
+
+_RL_AZUL  = rl_c.HexColor("#1B3A6B")
+_RL_VERDE = rl_c.HexColor("#2E7D32")
+_RL_CINZA = rl_c.HexColor("#F0F2F5")
+
+
+# ---------------------------------------------------------------------------
+# HELPERS PARA GRÁFICOS MATPLOTLIB (usados nos PDFs)
+# ---------------------------------------------------------------------------
+def _fmt_val(v, _=None):
+    if abs(v) >= 1e9:
+        return f"R$ {v/1e9:.2f}Bi"
+    if abs(v) >= 1e6:
+        return f"R$ {v/1e6:.2f}M"
+    if abs(v) >= 1e3:
+        return f"R$ {v/1e3:.1f}k"
+    return f"R$ {v:.0f}"
+
+
+def _grafico_barras_bytes(labels, vals_a, vals_b, label_a="Orçado", label_b="Realizado"):
+    fig, ax = plt.subplots(figsize=(10, 4))
+    x = range(len(labels))
+    w = 0.38
+    b1 = ax.bar([i - w/2 for i in x], vals_a, w, label=label_a,
+                color=COR_AZUL, alpha=0.85)
+    b2 = ax.bar([i + w/2 for i in x], vals_b, w, label=label_b,
+                color=COR_VERDE, alpha=0.85)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels, rotation=30, ha='right', fontsize=9)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_val))
+    ax.legend(fontsize=9)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    for bar in [*b1, *b2]:
+        h = bar.get_height()
+        if h > 0:
+            ax.annotate(_fmt_val(h), xy=(bar.get_x() + bar.get_width() / 2, h),
+                        xytext=(0, 2), textcoords="offset points",
+                        ha='center', va='bottom', fontsize=6.5)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _grafico_h_bytes(labels, valores, cor=COR_AZUL, pcts=None):
+    n = max(len(labels), 1)
+    fig, ax = plt.subplots(figsize=(10, max(3.5, n * 0.6)))
+    y = list(range(n))
+    ax.barh(y, valores, color=cor, alpha=0.85)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(_fmt_val))
+    ax.grid(axis='x', alpha=0.3, linestyle='--')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    for i, v in enumerate(valores):
+        txt = _fmt_val(v)
+        if pcts and i < len(pcts):
+            txt += f"  ({pcts[i]:.1f}%)"
+        ax.annotate(txt, xy=(v, i), xytext=(5, 0),
+                    textcoords="offset points", va='center', fontsize=7.5)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+# ---------------------------------------------------------------------------
+# HELPERS PARA PDF (reportlab)
+# ---------------------------------------------------------------------------
+def _estilos_pdf():
+    s = getSampleStyleSheet()
+    st_titulo = ParagraphStyle('T', parent=s['Heading1'], fontSize=14,
+                               textColor=_RL_AZUL, alignment=TA_CENTER,
+                               spaceAfter=3, leading=17)
+    st_sub    = ParagraphStyle('S', parent=s['Normal'],   fontSize=8.5,
+                               textColor=rl_c.grey, alignment=TA_CENTER, spaceAfter=6)
+    st_secao  = ParagraphStyle('SE', parent=s['Heading2'], fontSize=11,
+                               textColor=_RL_AZUL, spaceBefore=10, spaceAfter=4)
+    st_corpo  = ParagraphStyle('C', parent=s['Normal'],   fontSize=8, spaceAfter=2)
+    return st_titulo, st_sub, st_secao, st_corpo
+
+
+def _tabela_pdf(dados, col_w):
+    """Cria tabela ReportLab com word-wrap automático em todas as células."""
+    s = getSampleStyleSheet()
+    _st_h = ParagraphStyle(
+        "_th", parent=s["Normal"], fontSize=7.5, leading=10,
+        textColor=rl_c.white, fontName="Helvetica-Bold", wordWrap="LTR"
+    )
+    _st_b = ParagraphStyle(
+        "_tb", parent=s["Normal"], fontSize=7.5, leading=10, wordWrap="LTR"
+    )
+    _st_br = ParagraphStyle(
+        "_tbr", parent=s["Normal"], fontSize=7.5, leading=10,
+        wordWrap="LTR", alignment=2   # TA_RIGHT
+    )
+    dados_fmt = []
+    for i, row in enumerate(dados):
+        linha = []
+        for j, cell in enumerate(row):
+            if i == 0:
+                linha.append(Paragraph(str(cell), _st_h))
+            elif j >= 1:
+                linha.append(Paragraph(str(cell), _st_br))
+            else:
+                linha.append(Paragraph(str(cell), _st_b))
+        dados_fmt.append(linha)
+
+    t = Table(dados_fmt, colWidths=col_w, repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1,  0), _RL_AZUL),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [rl_c.white, _RL_CINZA]),
+        ("GRID",          (0, 0), (-1, -1), 0.35, rl_c.lightgrey),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    return t
+
+
+def _header_pdf(elements, st1, st2, titulo, periodo, filtros):
+    elements.append(Paragraph(
+        "UO 03601 — FUNAJURIS", st1))
+    elements.append(Paragraph(
+        "Gestão Financeira Integrada — FIPLAN / 2026", st2))
+    elements.append(HRFlowable(
+        width="100%", thickness=2, color=_RL_AZUL, spaceAfter=3))
+    elements.append(Paragraph(titulo, st1))
+    elements.append(Spacer(1, 3))
+    elements.append(Paragraph(
+        f"<b>Período:</b> {periodo}   |   <b>Filtros:</b> {filtros}", st2))
+    elements.append(HRFlowable(
+        width="100%", thickness=0.5, color=rl_c.lightgrey, spaceAfter=6))
+
+
+def gerar_pdf_receitas(df_rf, df_rec_total, mes_sel, filtros_str):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+          topMargin=1.3*cm, bottomMargin=1.3*cm,
+          leftMargin=1.5*cm, rightMargin=1.5*cm)
+    st1, st2, stS, stC = _estilos_pdf()
+    el = []
+    periodo = " / ".join(MESES_NOMES[m - 1] for m in sorted(mes_sel))
+    _header_pdf(el, st1, st2, "RELATÓRIO DE RECEITAS", periodo,
+                filtros_str or "Sem filtros adicionais")
+
+    v_real     = float(df_rf["realizado"].sum())
+    v_orc      = float(df_rf["orcado"].sum())
+    v_real_tot = float(df_rec_total["realizado"].sum()) if not df_rec_total.empty else 0
+    v_orc_tot  = float(df_rec_total["orcado"].sum())   if not df_rec_total.empty else 0
+    pct_sel    = v_real / v_real_tot * 100 if v_real_tot  > 0 else 0
+    pct_ating  = v_real / v_orc     * 100 if v_orc       > 0 else 0
+
+    el.append(_tabela_pdf([
+        ["Métrica", "Filtro Selecionado (R$)", "Total Banco (R$)", "% Filtro / Total"],
+        ["Orçado",     f"{v_orc:,.2f}",  f"{v_orc_tot:,.2f}",
+         f"{v_orc/v_orc_tot*100 if v_orc_tot>0 else 0:.1f}%"],
+        ["Realizado",  f"{v_real:,.2f}", f"{v_real_tot:,.2f}", f"{pct_sel:.1f}%"],
+        ["Atingimento",f"{pct_ating:.1f}%", "—", "—"],
+    ], [4*cm, 5*cm, 5*cm, 3*cm]))
+    el.append(Spacer(1, 10))
+
+    df_g = df_rf.groupby("mes").agg({"realizado": "sum", "orcado": "sum"}).reset_index()
+    if not df_g.empty:
+        el.append(Paragraph("Orçado vs Realizado por Mês", stS))
+        img = _grafico_barras_bytes(
+            [MESES_NOMES[m - 1] for m in df_g["mes"]],
+            list(df_g["orcado"]), list(df_g["realizado"]))
+        el.append(RLImage(img, width=17*cm, height=7*cm))
+        el.append(Spacer(1, 8))
+
+    if "categoria" in df_rf.columns:
+        df_cat = (df_rf.groupby("categoria")["realizado"]
+                  .sum().reset_index().sort_values("realizado"))
+        tot_c = float(df_cat["realizado"].sum())
+        pcts  = [v / tot_c * 100 if tot_c > 0 else 0 for v in df_cat["realizado"]]
+        el.append(Paragraph("Realizado por Categoria", stS))
+        el.append(RLImage(
+            _grafico_h_bytes(list(df_cat["categoria"]),
+                             list(df_cat["realizado"]),
+                             cor=COR_VERDE, pcts=pcts),
+            width=17*cm, height=max(3.5*cm, len(df_cat) * 1.3*cm)))
+        el.append(Spacer(1, 8))
+
+    el.append(Paragraph("Detalhamento por Natureza", stS))
+    df_tab = (df_rf.groupby(["categoria", "natureza"])
+              .agg({"orcado": "sum", "realizado": "sum"}).reset_index())
+    tot_t = float(df_tab["realizado"].sum())
+    rows  = [["Categoria", "Natureza", "Orçado (R$)", "Realizado (R$)", "% s/Total"]]
+    for _, r in df_tab.sort_values(["categoria", "realizado"], ascending=[True, False]).iterrows():
+        pct = r["realizado"] / tot_t * 100 if tot_t > 0 else 0
+        rows.append([r["categoria"], str(r["natureza"])[:45],
+                     f"{r['orcado']:,.2f}", f"{r['realizado']:,.2f}", f"{pct:.1f}%"])
+    if len(rows) > 1:
+        el.append(_tabela_pdf(rows, [3.5*cm, 6*cm, 3.5*cm, 3.5*cm, 2*cm]))
+
+    doc.build(el)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def gerar_pdf_despesas(df_ef, cred_banco, mes_sel, filtros_str):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+          topMargin=1.3*cm, bottomMargin=1.3*cm,
+          leftMargin=1.5*cm, rightMargin=1.5*cm)
+    st1, st2, stS, stC = _estilos_pdf()
+    el = []
+    periodo = " / ".join(MESES_NOMES[m - 1] for m in sorted(mes_sel))
+    _header_pdf(el, st1, st2, "RELATÓRIO DE DESPESAS", periodo,
+                filtros_str or "Sem filtros adicionais")
+
+    emp  = float(df_ef["empenhado"].sum()) if not df_ef.empty else 0
+    liq  = float(df_ef["liquidado"].sum()) if not df_ef.empty else 0
+    pago = float(df_ef["pago"].sum())      if not df_ef.empty else 0
+
+    el.append(_tabela_pdf([
+        ["Métrica", "Valor (R$)", "% Cred. Autorizado"],
+        ["Crédito Autorizado", f"{cred_banco:,.2f}", "100,00%"],
+        ["Empenhado",  f"{emp:,.2f}",  f"{emp /cred_banco*100 if cred_banco>0 else 0:.2f}%"],
+        ["Liquidado",  f"{liq:,.2f}",  f"{liq /cred_banco*100 if cred_banco>0 else 0:.2f}%"],
+        ["Pago",       f"{pago:,.2f}", f"{pago/cred_banco*100 if cred_banco>0 else 0:.2f}%"],
+    ], [5*cm, 6*cm, 5*cm]))
+    el.append(Spacer(1, 10))
+
+    if not df_ef.empty:
+        df_g = (df_ef.groupby("mes")[["empenhado", "liquidado"]]
+                .sum().reset_index())
+        el.append(Paragraph("Empenhado vs Liquidado por Mês", stS))
+        el.append(RLImage(
+            _grafico_barras_bytes(
+                [MESES_NOMES[m - 1] for m in df_g["mes"]],
+                list(df_g["empenhado"]), list(df_g["liquidado"]),
+                "Empenhado", "Liquidado"),
+            width=17*cm, height=7*cm))
+        el.append(Spacer(1, 8))
+
+        df_nat = (df_ef.groupby("natureza")[["empenhado", "liquidado"]]
+                  .sum().reset_index()
+                  .sort_values("liquidado", ascending=True).tail(15))
+        tot_n = float(df_nat["liquidado"].sum())
+        pcts_n = [v / tot_n * 100 if tot_n > 0 else 0 for v in df_nat["liquidado"]]
+        el.append(Paragraph("Liquidado por Natureza (Top 15)", stS))
+        el.append(RLImage(
+            _grafico_h_bytes(list(df_nat["natureza"].astype(str)),
+                             list(df_nat["liquidado"]), pcts=pcts_n),
+            width=17*cm, height=max(4*cm, len(df_nat) * 1.1*cm)))
+        el.append(Spacer(1, 8))
+
+        el.append(Paragraph("Detalhamento por Natureza", stS))
+        df_tab = (df_ef.groupby("natureza")[["empenhado", "liquidado", "pago"]]
+                  .sum().reset_index())
+        tot_t = float(df_tab["liquidado"].sum())
+        rows  = [["Natureza", "Empenhado (R$)", "Liquidado (R$)", "Pago (R$)", "% Liq."]]
+        for _, r in df_tab.sort_values("liquidado", ascending=False).iterrows():
+            pct = r["liquidado"] / tot_t * 100 if tot_t > 0 else 0
+            rows.append([str(r["natureza"])[:35],
+                         f"{r['empenhado']:,.2f}", f"{r['liquidado']:,.2f}",
+                         f"{r['pago']:,.2f}", f"{pct:.1f}%"])
+        if len(rows) > 1:
+            el.append(_tabela_pdf(rows, [4.5*cm, 3.5*cm, 3.5*cm, 3.5*cm, 2.5*cm]))
+
+    doc.build(el)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _limpar_labels(series, max_len=40):
+    """Remove acentos e trunca labels para evitar falhas no matplotlib."""
+    resultado = []
+    for v in series:
+        s = sem_acento(str(v).replace("\xa0", " ").strip())
+        resultado.append(s[:max_len])
+    return resultado
+
+
+def _h_bytes_seguro(labels, valores, cor=None, pcts=None):
+    """Wrapper de _grafico_h_bytes com sanitização e cap de altura."""
+    labels_limpos = _limpar_labels(labels)
+    cor = cor or COR_AZUL
+    try:
+        return _grafico_h_bytes(labels_limpos, valores, cor=cor, pcts=pcts)
+    except Exception:
+        # Fallback: gráfico sem labels
+        return _grafico_h_bytes(
+            [str(i + 1) for i in range(len(valores))], valores, cor=cor)
+
+
+# Altura máxima de gráfico que cabe em A4 com margens (cm)
+_MAX_H_GRAF = 20 * cm
+
+
+def gerar_pdf_701(df_sv, df_sub_total, mes_sel, filtros_str):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+          topMargin=1.3*cm, bottomMargin=1.3*cm,
+          leftMargin=1.5*cm, rightMargin=1.5*cm)
+    st1, st2, stS, stC = _estilos_pdf()
+    el = []
+    periodo = (" / ".join(MESES_NOMES[m - 1] for m in sorted(mes_sel))
+               if mes_sel else "—")
+    _header_pdf(el, st1, st2, "RELATÓRIO DE SUB-ELEMENTOS (FIP 701)", periodo,
+                filtros_str or "Sem filtros adicionais")
+
+    liq_sel  = float(df_sv["liquidado"].sum())        if not df_sv.empty        else 0
+    pago_sel = float(df_sv["pago"].sum())             if not df_sv.empty        else 0
+    liq_tot  = float(df_sub_total["liquidado"].sum()) if not df_sub_total.empty else 0
+    pago_tot = float(df_sub_total["pago"].sum())      if not df_sub_total.empty else 0
+
+    el.append(_tabela_pdf([
+        ["Métrica", "Filtro (R$)", "Total Banco (R$)", "% Filtro / Total"],
+        ["Liquidado", f"{liq_sel:,.2f}",  f"{liq_tot:,.2f}",
+         f"{liq_sel / liq_tot * 100 if liq_tot > 0 else 0:.1f}%"],
+        ["Pago",      f"{pago_sel:,.2f}", f"{pago_tot:,.2f}",
+         f"{pago_sel / pago_tot * 100 if pago_tot > 0 else 0:.1f}%"],
+    ], [4*cm, 5*cm, 5*cm, 3*cm]))
+    el.append(Spacer(1, 10))
+
+    if not df_sv.empty:
+        # --- Gráfico por sub-elemento (Top 20) ---
+        df_sub_g = (df_sv.groupby("subelemento_desc")[["liquidado"]]
+                    .sum().reset_index()
+                    .sort_values("liquidado", ascending=True).tail(20))
+        tot_s  = float(df_sub_g["liquidado"].sum())
+        pcts_s = [v / tot_s * 100 if tot_s > 0 else 0 for v in df_sub_g["liquidado"]]
+        h_sub  = min(_MAX_H_GRAF, max(5*cm, len(df_sub_g) * 1.1*cm))
+        el.append(Paragraph(f"Liquidado por Sub-elemento (Top {len(df_sub_g)})", stS))
+        el.append(RLImage(
+            _h_bytes_seguro(list(df_sub_g["subelemento_desc"]), list(df_sub_g["liquidado"]),
+                            pcts=pcts_s),
+            width=17*cm, height=h_sub))
+        el.append(Spacer(1, 8))
+
+        # --- Gráfico por natureza (Top 15) ---
+        df_nat = (df_sv.groupby(["natureza_cod", "natureza_desc"])[["liquidado"]]
+                  .sum().reset_index()
+                  .sort_values("liquidado", ascending=True).tail(15))
+        tot_n  = float(df_nat["liquidado"].sum())
+        pcts_n = [v / tot_n * 100 if tot_n > 0 else 0 for v in df_nat["liquidado"]]
+        h_nat  = min(_MAX_H_GRAF, max(3.5*cm, len(df_nat) * 1.3*cm))
+        el.append(Paragraph(f"Liquidado por Natureza de Despesa (Top {len(df_nat)})", stS))
+        el.append(RLImage(
+            _h_bytes_seguro(list(df_nat["natureza_desc"]), list(df_nat["liquidado"]),
+                            cor=COR_VERDE, pcts=pcts_n),
+            width=17*cm, height=h_nat))
+        el.append(Spacer(1, 8))
+
+        # --- Tabela de detalhamento ---
+        el.append(Paragraph("Detalhamento Completo", stS))
+        df_tab = (df_sv.groupby(
+            ["subelemento_cod", "subelemento_desc", "natureza_cod", "natureza_desc"])
+            [["liquidado", "pago"]].sum().reset_index())
+        tot_t = float(df_tab["liquidado"].sum())
+        rows  = [["Sub-elemento", "Natureza", "Liquidado (R$)", "Pago (R$)", "% s/Total"]]
+        for _, r in df_tab.sort_values("liquidado", ascending=False).iterrows():
+            pct = r["liquidado"] / tot_t * 100 if tot_t > 0 else 0
+            rows.append([
+                sem_acento(str(r["subelemento_desc"])),
+                sem_acento(str(r["natureza_desc"])),
+                f"{r['liquidado']:,.2f}", f"{r['pago']:,.2f}", f"{pct:.1f}%"
+            ])
+        if len(rows) > 1:
+            el.append(_tabela_pdf(rows, [5.5*cm, 5*cm, 3*cm, 2.5*cm, 1.5*cm]))
+
+    doc.build(el)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def gerar_pdf_comparativo(tr, te, tl, tp, v_orc, mes_sel, df_rec, df_exec):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+          topMargin=1.3*cm, bottomMargin=1.3*cm,
+          leftMargin=1.5*cm, rightMargin=1.5*cm)
+    st1, st2, stS, stC = _estilos_pdf()
+    el = []
+    periodo = (" / ".join(MESES_NOMES[m - 1] for m in sorted(mes_sel))
+               if mes_sel else "—")
+    _header_pdf(el, st1, st2, "RELATÓRIO COMPARATIVO — RECEITA × DESPESA",
+                periodo, "Período selecionado")
+
+    sup_fin  = tr - tp
+    sup_orc  = tr - te
+    pct_emp  = te / tr * 100 if tr > 0 else 0
+    pct_liq  = tl / tr * 100 if tr > 0 else 0
+    pct_pag  = tp / tr * 100 if tr > 0 else 0
+    pct_cred = te / v_orc * 100 if v_orc > 0 else 0
+
+    el.append(_tabela_pdf([
+        ["Indicador", "Valor (R$)", "% s/ Receita Arrecadada"],
+        ["Receita Arrecadada",  f"{tr:,.2f}", "100,00%"],
+        ["Cred. Autorizado",    f"{v_orc:,.2f}", "—"],
+        ["Desp. Empenhada",     f"{te:,.2f}", f"{pct_emp:.2f}%"],
+        ["Desp. Liquidada",     f"{tl:,.2f}", f"{pct_liq:.2f}%"],
+        ["Desp. Paga",          f"{tp:,.2f}", f"{pct_pag:.2f}%"],
+        ["Superávit Financeiro (Rec. - Pago)",     f"{sup_fin:,.2f}", "—"],
+        ["Superávit Orçamentário (Rec. - Emp.)",   f"{sup_orc:,.2f}", "—"],
+    ], [7*cm, 5.5*cm, 5*cm]))
+    el.append(Spacer(1, 12))
+
+    # Gráfico mensal receita vs despesa
+    if not df_rec.empty and not df_exec.empty and mes_sel:
+        meses_comuns = sorted(set(mes_sel))
+        rec_m = (df_rec[df_rec["mes"].isin(meses_comuns)]
+                 .groupby("mes")["realizado"].sum().reindex(meses_comuns, fill_value=0))
+        emp_m = (df_exec[df_exec["mes"].isin(meses_comuns)]
+                 .groupby("mes")["empenhado"].sum().reindex(meses_comuns, fill_value=0))
+        liq_m = (df_exec[df_exec["mes"].isin(meses_comuns)]
+                 .groupby("mes")["liquidado"].sum().reindex(meses_comuns, fill_value=0))
+        labels_m = [MESES_NOMES[m - 1] for m in meses_comuns]
+        el.append(Paragraph("Receita vs Despesas por Mês", stS))
+        el.append(RLImage(
+            _grafico_barras_bytes(labels_m, list(rec_m), list(emp_m),
+                                  "Receita Arrecadada", "Desp. Empenhada"),
+            width=17*cm, height=7*cm))
+        el.append(Spacer(1, 8))
+
+        # Liquidado vs Pago
+        el.append(Paragraph("Desp. Liquidada vs Paga por Mês", stS))
+        el.append(RLImage(
+            _grafico_barras_bytes(labels_m, list(liq_m),
+                                  list(df_exec[df_exec["mes"].isin(meses_comuns)]
+                                       .groupby("mes")["pago"].sum()
+                                       .reindex(meses_comuns, fill_value=0)),
+                                  "Liquidado", "Pago"),
+            width=17*cm, height=7*cm))
+
+    doc.build(el)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # BANCO DE DADOS
 # ---------------------------------------------------------------------------
 def inicializar_banco():
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS receitas ("
@@ -431,28 +893,12 @@ def inicializar_banco():
         "orcado REAL, realizado REAL, previsao REAL, "
         "categoria TEXT DEFAULT 'Nao Classificada')"
     )
-    try:
-        conn.execute(
-            "ALTER TABLE receitas ADD COLUMN categoria TEXT DEFAULT 'Nao Classificada'"
-        )
-    except Exception:
-        pass
-
-    # Orcamento: importado da FIP 616 (dotacao / credito autorizado)
-    # Colunas 616: [0]PODER [1]UO [2]UG [3]FUNCAO [4]SUBFUNCAO [5]PROGRAMA
-    #              [6]PAOE  [7]NATUREZA [8]MODALIDADE [9]ELEMENTO [10]FONTE
-    #              [11]ORCADO INICIAL  [12]CREDITO AUTORIZADO
     conn.execute(
         "CREATE TABLE IF NOT EXISTS orcamento ("
         "mes INTEGER, ano INTEGER, uo TEXT, ug TEXT, funcao TEXT, subfuncao TEXT, "
         "programa TEXT, projeto TEXT, natureza TEXT, fonte TEXT, "
         "orcado_inicial REAL, cred_autorizado REAL)"
     )
-
-    # Execucao: importado da FIP 613 (valores mensais diretos, nao acumulados)
-    # Colunas 613: [0]UO [1]UG [2]FUNCAO [3]SUBFUNCAO [4]PROGRAMA [5]PROJETO
-    #              [6]REGIONAL [7]NATUREZA [8]FONTE [9]IDUSO [10]TIPO_REC
-    #              [21]EMPENHADO [22]LIQUIDADO [24]VALOR PAGO
     conn.execute(
         "CREATE TABLE IF NOT EXISTS execucao ("
         "mes INTEGER, ano INTEGER, uo TEXT, ug TEXT, funcao TEXT, subfuncao TEXT, "
@@ -460,28 +906,39 @@ def inicializar_banco():
         "iduso TEXT, tipo_rec TEXT, "
         "empenhado REAL, liquidado REAL, pago REAL)"
     )
-
-    # Recria sub_elementos se a coluna fonte nao estiver na posicao correta
-    # (problema de ALTER TABLE que adiciona ao final, causando mapeamento errado)
-    cols_sub = [r[1] for r in conn.execute("PRAGMA table_info(sub_elementos)").fetchall()]
-    schema_correto = (
-        cols_sub == ["mes", "ano", "paoe", "natureza_cod", "natureza_desc",
-                     "subelemento_cod", "subelemento_desc", "fonte", "liquidado", "pago"]
-    )
-    if not schema_correto:
-        conn.execute("DROP TABLE IF EXISTS sub_elementos")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sub_elementos ("
-        "mes INTEGER, ano INTEGER, paoe TEXT, natureza_cod TEXT, natureza_desc TEXT, "
+        "mes INTEGER, ano INTEGER, ug TEXT, paoe TEXT, natureza_cod TEXT, natureza_desc TEXT, "
         "subelemento_cod TEXT, subelemento_desc TEXT, fonte TEXT, "
         "liquidado REAL, pago REAL)"
     )
-    # Migração: renomeia categoria antiga se ainda existir no banco
     conn.execute(
-        "UPDATE receitas SET categoria='Receita Corrente' "
-        "WHERE categoria='Repasses Correntes'"
+        "CREATE TABLE IF NOT EXISTS anexo_v ("
+        "mes INTEGER, ano INTEGER, data TEXT, "
+        "entidade_repassadora TEXT, valor REAL, "
+        "finalidade TEXT, fundamento_legal TEXT)"
     )
     conn.commit()
+
+    for stmt in [
+        "ALTER TABLE receitas ADD COLUMN categoria TEXT DEFAULT 'Nao Classificada'",
+        "ALTER TABLE sub_elementos ADD COLUMN ug TEXT DEFAULT ''",
+    ]:
+        try:
+            conn.execute(stmt)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+
+    try:
+        conn.execute(
+            "UPDATE receitas SET categoria='Receita Corrente' "
+            "WHERE categoria='Repasses Correntes'"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
     conn.close()
 
 
@@ -491,6 +948,7 @@ def limpar_todos_dados():
     conn.execute("DELETE FROM orcamento")
     conn.execute("DELETE FROM execucao")
     conn.execute("DELETE FROM sub_elementos")
+    conn.execute("DELETE FROM anexo_v")
     try:
         conn.execute("DELETE FROM despesas")
     except Exception:
@@ -512,7 +970,8 @@ with st.sidebar:
             "Receita (FIP 729)",
             "Orcamento (FIP 616)",
             "Execucao (FIP 613)",
-            "Sub-elemento (FIP 701)"
+            "Sub-elemento (FIP 701)",
+            "Repasses Recebidos (ANEXO V)"
         ]
     )
     arquivo = st.file_uploader("Arquivo Excel", type=["xlsx"])
@@ -524,7 +983,6 @@ with st.sidebar:
 
             # ----------------------------------------------------------------
             # RECEITA (FIP 729)
-            # skiprows=7: [0]cod [1]natureza [3]orcado [5]previsao [6]realizado
             # ----------------------------------------------------------------
             if tipo_dado == "Receita (FIP 729)":
                 df = pd.read_excel(arquivo, skiprows=7, header=0)
@@ -532,7 +990,7 @@ with st.sidebar:
                 for _, row in df.iterrows():
                     try:
                         cod = str(row.iloc[0]).strip().replace('"', "")
-                        if not re.match(r"^\d", cod) or cod[-1] == "0":
+                        if not re.match(r"^\d", cod) or cod.endswith(".00"):
                             continue
                         real = limpar_f(row.iloc[6])
                         if cod.startswith("9"):
@@ -562,11 +1020,7 @@ with st.sidebar:
                 )
 
             # ----------------------------------------------------------------
-            # ORCAMENTO (FIP 616) - apenas dotacao e credito autorizado
-            # skiprows=6 -> header na linha 6 do Excel (0-indexado)
-            # [0]PODER [1]UO [2]UG [3]FUNCAO [4]SUBFUNCAO [5]PROGRAMA
-            # [6]PAOE  [7]NATUREZA DESPESA [8]MODALIDADE [9]ELEMENTO
-            # [10]FONTE [11]ORCADO INICIAL [12]CREDITO AUTORIZADO
+            # ORCAMENTO (FIP 616)
             # ----------------------------------------------------------------
             elif tipo_dado == "Orcamento (FIP 616)":
                 df = pd.read_excel(arquivo, skiprows=6, header=0)
@@ -579,7 +1033,7 @@ with st.sidebar:
                 for _, row in df.iterrows():
                     try:
                         uo = norm(gc616(row, 1))
-                        if not uo or uo in ("nan", ""):
+                        if not uo or uo in ("nan", "") or uo != "3601":
                             continue
                         ug        = norm(gc616(row, 2))
                         funcao    = norm(gc616(row, 3))
@@ -590,7 +1044,6 @@ with st.sidebar:
                         fonte     = norm(gc616(row, 10))
                         orc_ini   = limpar_f(gc616(row, 11, 0))
                         cred_aut  = limpar_f(gc616(row, 12, 0))
-                        # Guarda somente linhas com algum valor orcamentario
                         if orc_ini == 0 and cred_aut == 0:
                             continue
                         linhas.append((
@@ -601,9 +1054,7 @@ with st.sidebar:
                     except Exception:
                         continue
 
-                conn.execute(
-                    "DELETE FROM orcamento WHERE ano=2026 AND mes=?", (m_final,)
-                )
+                conn.execute("DELETE FROM orcamento WHERE ano=2026")
                 conn.executemany(
                     "INSERT INTO orcamento VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", linhas
                 )
@@ -616,12 +1067,7 @@ with st.sidebar:
                 )
 
             # ----------------------------------------------------------------
-            # EXECUCAO (FIP 613) - valores mensais diretos (nao acumulados)
-            # skiprows=10 -> header real na linha 10 do Excel (0-indexado)
-            # [0]UO [1]UG [2]FUNCAO [3]SUBFUNCAO [4]PROGRAMA [5]PROJETO
-            # [6]REGIONAL [7]NATUREZA [8]FONTE [9]IDUSO [10]TIPO_REC
-            # [11]DOTACAO INICIAL ... [16]CRED AUTORIZADO ...
-            # [21]EMPENHADO [22]LIQUIDADO [23]A LIQUIDAR [24]VALOR PAGO
+            # EXECUCAO (FIP 613)
             # ----------------------------------------------------------------
             elif tipo_dado == "Execucao (FIP 613)":
                 df = pd.read_excel(arquivo, skiprows=10, header=0)
@@ -636,7 +1082,6 @@ with st.sidebar:
                         uo = norm(gc613(row, 0))
                         if not uo or uo in ("nan", "", "_"):
                             continue
-                        # Iduso=NaN indica linhas de TOTAL/SUBTOTAL -> pula
                         if pd.isna(gc613(row, 9, float("nan"))):
                             continue
                         ug        = norm(gc613(row, 1))
@@ -652,7 +1097,6 @@ with st.sidebar:
                         emp = limpar_f(gc613(row, 21, 0))
                         liq = limpar_f(gc613(row, 22, 0))
                         pag = limpar_f(gc613(row, 24, 0))
-                        # Guarda somente linhas com execucao real
                         if emp == 0 and liq == 0 and pag == 0:
                             continue
                         linhas.append((
@@ -686,13 +1130,11 @@ with st.sidebar:
 
             # ----------------------------------------------------------------
             # SUB-ELEMENTO (FIP 701)
-            # Estrutura hierarquica: PROJ/ATIV -> NATUREZA -> subelementos
-            # col[0]=descricao  col[1]=LIQUIDADO  col[2]=PAGO
-            # A 701 e acumulada, entao subtrai meses anteriores
             # ----------------------------------------------------------------
             elif tipo_dado == "Sub-elemento (FIP 701)":
                 df701 = pd.read_excel(arquivo, header=None)
                 linhas = []
+                cur_ug = ""
                 cur_paoe = ""
                 cur_nat_cod = ""
                 cur_nat_desc = ""
@@ -702,6 +1144,12 @@ with st.sidebar:
                     if i < 8 or not text or text == "nan":
                         continue
                     tu = sem_acento(text).upper()
+
+                    if re.match(r"^UG\s+\d+", tu):
+                        m = re.search(r"(\d+)", text)
+                        if m:
+                            cur_ug = m.group(1).strip()
+                        continue
 
                     if "PROJ/ATIV" in tu and ":" in tu:
                         m = re.search(r"(\d{5,8})", text)
@@ -728,7 +1176,6 @@ with st.sidebar:
                         parts = text.split(" ", 1)
                         sub_cod  = parts[0].strip()
                         sub_desc = parts[1].strip() if len(parts) > 1 else ""
-                        # Fonte: ultimo segmento do codigo (ex: 3.3.90.47.47.016.17600000)
                         fonte_sub = sub_cod.rsplit(".", 1)[-1] if "." in sub_cod else ""
                         liq_cum  = (
                             limpar_f(row.iloc[1]) if pd.notna(row.iloc[1]) else 0.0
@@ -737,6 +1184,7 @@ with st.sidebar:
                             limpar_f(row.iloc[2]) if pd.notna(row.iloc[2]) else 0.0
                         )
                         linhas.append({
+                            "ug": cur_ug,
                             "paoe": cur_paoe,
                             "nat_cod": cur_nat_cod,
                             "nat_desc": cur_nat_desc,
@@ -750,9 +1198,7 @@ with st.sidebar:
                 if not linhas:
                     st.warning("Nenhum sub-elemento valido encontrado.")
                 else:
-                    # A 701 ja traz valores mensais diretos (como a 613).
-                    # Armazenamos os valores do mes sem qualquer subtracao.
-                    chaves_701 = ["paoe", "nat_cod", "sub_cod"]
+                    chaves_701 = ["ug", "paoe", "nat_cod", "sub_cod"]
                     df_mes = (
                         pd.DataFrame(linhas)
                         .groupby(
@@ -767,7 +1213,7 @@ with st.sidebar:
                     dados = [
                         (
                             m_final, 2026,
-                            r.paoe, r.nat_cod, r.nat_desc,
+                            r.ug, r.paoe, r.nat_cod, r.nat_desc,
                             r.sub_cod, r.sub_desc, r.fonte,
                             float(r.liq_cum), float(r.pag_cum),
                         )
@@ -779,19 +1225,62 @@ with st.sidebar:
                     )
                     conn.executemany(
                         "INSERT INTO sub_elementos "
-                        "(mes, ano, paoe, natureza_cod, natureza_desc, "
+                        "(mes, ano, ug, paoe, natureza_cod, natureza_desc, "
                         "subelemento_cod, subelemento_desc, fonte, liquidado, pago) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                         dados
                     )
                     conn.commit()
-                    liq_t = sum(r[8] for r in dados)
-                    pag_t = sum(r[9] for r in dados)
+                    liq_t = sum(r[9] for r in dados)
+                    pag_t = sum(r[10] for r in dados)
+                    ugs_imp = sorted(set(r[2] for r in dados if r[2]))
                     st.success(
                         "Sub-elemento " + MESES_NOMES[m_final - 1] + "/2026: "
                         + str(len(dados)) + " registros | "
                         + "Liq R$ {:,.0f} | Pago R$ {:,.0f}".format(liq_t, pag_t)
                     )
+                    if ugs_imp:
+                        st.info("UGs importadas: " + str(ugs_imp))
+
+            # ----------------------------------------------------------------
+            # REPASSES RECEBIDOS (ANEXO V)
+            # Estrutura: header na linha 9 (0-indexed), dados a partir da linha 10
+            # Colunas: Data | Entidade Repassadora | Valor | Finalidade | Fundamento Legal
+            # ----------------------------------------------------------------
+            elif tipo_dado == "Repasses Recebidos (ANEXO V)":
+                df_av = pd.read_excel(arquivo, skiprows=9, header=0)
+                dados_av = []
+                for _, row in df_av.iterrows():
+                    try:
+                        data_val = str(row.iloc[0]).strip()
+                        # Para quando chega na linha de total ou vazia
+                        if not data_val or data_val in ("nan", "") or "Total" in data_val:
+                            continue
+                        entidade = str(row.iloc[1]).strip().replace("\xa0", " ")
+                        if not entidade or entidade in ("nan", "Entidade Repassadora"):
+                            continue
+                        valor = limpar_f(row.iloc[2])
+                        finalidade = str(row.iloc[3]).strip().replace("\xa0", " ") if pd.notna(row.iloc[3]) else ""
+                        fundamento = str(row.iloc[4]).strip() if pd.notna(row.iloc[4]) else ""
+                        dados_av.append((
+                            m_final, 2026, data_val, entidade, valor, finalidade, fundamento
+                        ))
+                    except Exception:
+                        continue
+
+                conn.execute(
+                    "DELETE FROM anexo_v WHERE ano=2026 AND mes=?", (m_final,)
+                )
+                conn.executemany(
+                    "INSERT INTO anexo_v VALUES (?,?,?,?,?,?,?)", dados_av
+                )
+                conn.commit()
+                total_av = sum(r[4] for r in dados_av)
+                st.success(
+                    "ANEXO V " + MESES_NOMES[m_final - 1] + "/2026: "
+                    + str(len(dados_av)) + " registros | "
+                    + "Total R$ {:,.2f}".format(total_av)
+                )
 
             conn.close()
 
@@ -804,10 +1293,11 @@ with st.sidebar:
     st.subheader("Backup Completo")
     conn_b = sqlite3.connect(DB_NAME)
     tbls = {
-        "receitas":     pd.read_sql("SELECT * FROM receitas",      conn_b),
-        "orcamento":    pd.read_sql("SELECT * FROM orcamento",     conn_b),
-        "execucao":     pd.read_sql("SELECT * FROM execucao",      conn_b),
-        "sub_elementos":pd.read_sql("SELECT * FROM sub_elementos", conn_b),
+        "receitas":      pd.read_sql("SELECT * FROM receitas",      conn_b),
+        "orcamento":     pd.read_sql("SELECT * FROM orcamento",     conn_b),
+        "execucao":      pd.read_sql("SELECT * FROM execucao",      conn_b),
+        "sub_elementos": pd.read_sql("SELECT * FROM sub_elementos", conn_b),
+        "anexo_v":       pd.read_sql("SELECT * FROM anexo_v",       conn_b),
     }
     conn_b.close()
     for nome_tab, df_tab in tbls.items():
@@ -822,7 +1312,7 @@ with st.sidebar:
     st.caption("Restaurar tabela (CSV do backup):")
     tabela_rest = st.selectbox(
         "Tabela a restaurar:",
-        ["receitas", "orcamento", "execucao", "sub_elementos"],
+        ["receitas", "orcamento", "execucao", "sub_elementos", "anexo_v"],
         key="tabela_rest"
     )
     file_restore = st.file_uploader("Arquivo CSV", type=["csv"], key="file_rest")
@@ -850,10 +1340,11 @@ with st.sidebar:
 # CARGA PRINCIPAL
 # ---------------------------------------------------------------------------
 conn_main = sqlite3.connect(DB_NAME)
-df_rec  = pd.read_sql("SELECT * FROM receitas",      conn_main)
-df_orc  = pd.read_sql("SELECT * FROM orcamento",     conn_main)
-df_exec = pd.read_sql("SELECT * FROM execucao",      conn_main)
-df_sub  = pd.read_sql("SELECT * FROM sub_elementos", conn_main)
+df_rec    = pd.read_sql("SELECT * FROM receitas",      conn_main)
+df_orc    = pd.read_sql("SELECT * FROM orcamento",     conn_main)
+df_exec   = pd.read_sql("SELECT * FROM execucao",      conn_main)
+df_sub    = pd.read_sql("SELECT * FROM sub_elementos", conn_main)
+df_anexov = pd.read_sql("SELECT * FROM anexo_v",       conn_main)
 conn_main.close()
 
 tab1, tab2, tab3, tab4 = st.tabs(["Receitas", "Despesas", "Comparativo", "Relatorios LRF"])
@@ -902,18 +1393,24 @@ with tab1:
             df_rf = df_rf[df_rf["natureza"].isin(nat_sel)]
 
         if not df_rf.empty and ms_r:
-            v_real = df_rf["realizado"].sum()
-            v_orc  = (
+            v_real     = float(df_rf["realizado"].sum())
+            v_real_tot = float(df_rec["realizado"].sum())
+            v_orc      = float(
                 df_rec[df_rec["mes"] == max(ms_r)]
                 .groupby("codigo_full")["orcado"].max().sum()
             )
-            k1, k2, k3 = st.columns(3)
-            k1.metric("Orcado Atual",  "R$ {:,.2f}".format(v_orc))
-            k2.metric("Realizado",     "R$ {:,.2f}".format(v_real))
-            k3.metric("Atingimento",
-                      "{:.1f}%".format(v_real / v_orc * 100 if v_orc != 0 else 0))
+            pct_filtro = v_real / v_real_tot * 100 if v_real_tot > 0 else 0
+            pct_ating  = v_real / v_orc      * 100 if v_orc      > 0 else 0
 
-            df_g = df_rf.groupby("mes").agg({"realizado": "sum"}).reset_index()
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Orçado (Atualizado)",  "R$ {:,.2f}".format(v_orc))
+            k2.metric("Realizado (Filtro)",   "R$ {:,.2f}".format(v_real))
+            k3.metric("Atingimento",          "{:.1f}%".format(pct_ating))
+            k4.metric("% do Filtro s/ Total", "{:.1f}%".format(pct_filtro))
+
+            # Gráfico principal: orçado + realizado + previsão por mês
+            df_g = df_rf.groupby("mes").agg(
+                {"realizado": "sum", "orcado": "sum"}).reset_index()
             df_g["previsao"] = [
                 df_rf[df_rf["mes"] == m].groupby("codigo_full")["previsao"].max().sum()
                 for m in df_g["mes"]
@@ -921,31 +1418,178 @@ with tab1:
             fig = go.Figure()
             fig.add_trace(go.Bar(
                 x=[MESES_NOMES[m - 1] for m in df_g["mes"]],
-                y=df_g["realizado"], name="Realizado", marker_color="#2E7D32"
+                y=df_g["orcado"], name="Orçado", marker_color=COR_AZUL,
+                opacity=0.7,
+                text=["{:.1f}M".format(v / 1e6) for v in df_g["orcado"]],
+                textposition="inside"
+            ))
+            fig.add_trace(go.Bar(
+                x=[MESES_NOMES[m - 1] for m in df_g["mes"]],
+                y=df_g["realizado"], name="Realizado", marker_color=COR_VERDE,
+                text=["{:.1f}M".format(v / 1e6) for v in df_g["realizado"]],
+                textposition="inside"
             ))
             fig.add_trace(go.Scatter(
                 x=[MESES_NOMES[m - 1] for m in df_g["mes"]],
-                y=df_g["previsao"], name="Previsao",
-                line=dict(color="#FF9800", width=3, dash="dot")
+                y=df_g["previsao"], name="Previsão Mensal",
+                line=dict(color="#FF9800", width=2.5, dash="dot"),
+                mode="lines+markers"
             ))
             fig.update_layout(
-                height=350, margin=dict(l=0, r=0, t=30, b=0),
+                title="Receita por Mês — Orçado vs Realizado",
+                height=380, barmode="group",
+                margin=dict(l=0, r=0, t=40, b=0),
                 hovermode="x unified",
+                plot_bgcolor="white",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                            xanchor="right", x=1)
+                            xanchor="right", x=1),
+                yaxis=dict(tickformat=",.0f", gridcolor="#F0F0F0")
             )
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Gráfico horizontal: realizado por categoria com %
+            df_cat = (df_rf.groupby("categoria")
+                      .agg({"realizado": "sum", "orcado": "sum"})
+                      .reset_index()
+                      .sort_values("realizado", ascending=True))
+            tot_cat = float(df_cat["realizado"].sum())
+            df_cat["pct"] = df_cat["realizado"].apply(
+                lambda v: v / tot_cat * 100 if tot_cat > 0 else 0)
+            df_cat["pct_ating"] = df_cat.apply(
+                lambda r: r["realizado"] / r["orcado"] * 100 if r["orcado"] > 0 else 0,
+                axis=1)
+            fig_cat = go.Figure()
+            fig_cat.add_trace(go.Bar(
+                y=df_cat["categoria"],
+                x=df_cat["orcado"], name="Orçado",
+                orientation="h", marker_color=COR_AZUL, opacity=0.6
+            ))
+            fig_cat.add_trace(go.Bar(
+                y=df_cat["categoria"],
+                x=df_cat["realizado"], name="Realizado",
+                orientation="h", marker_color=COR_VERDE,
+                text=["{:.1f}%  ({:.1f}% s/total)".format(r["pct_ating"], r["pct"])
+                      for _, r in df_cat.iterrows()],
+                textposition="outside"
+            ))
+            fig_cat.update_layout(
+                title="Realizado por Categoria — % Atingimento e % s/ Total",
+                height=max(260, len(df_cat) * 60),
+                barmode="overlay",
+                margin=dict(l=0, r=0, t=40, b=0),
+                plot_bgcolor="white",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                            xanchor="right", x=1),
+                xaxis=dict(tickformat=",.0f", gridcolor="#F0F0F0")
+            )
+            st.plotly_chart(fig_cat, use_container_width=True)
+
             st.dataframe(
-                df_rf[["categoria", "codigo_full", "natureza", "realizado", "orcado"]]
+                df_rf[["categoria", "codigo_full", "natureza",
+                        "realizado", "orcado"]]
+                .assign(pct_total=lambda d:
+                    (d["realizado"] / v_real_tot * 100).round(2).astype(str) + "%")
+                .rename(columns={"pct_total": "% s/ Total"})
                 .style.format({"realizado": "{:,.2f}", "orcado": "{:,.2f}"}),
+                use_container_width=True
+            )
+
+            # Exportar PDF
+            st.divider()
+            filtros_str_r = (
+                ("Categorias: " + ", ".join(cat_sel) if cat_sel else "") +
+                ("  |  Naturezas: " + ", ".join(str(n) for n in nat_sel) if nat_sel else "")
+            ).strip(" | ") or "Todos"
+            try:
+                pdf_bytes = gerar_pdf_receitas(df_rf, df_rec, ms_r, filtros_str_r)
+                st.download_button(
+                    "📄 Exportar Relatório PDF — Receitas",
+                    data=pdf_bytes,
+                    file_name="relatorio_receitas.pdf",
+                    mime="application/pdf",
+                    key="pdf_rec"
+                )
+            except Exception as e:
+                st.warning("PDF indisponível: " + str(e))
+
+    # -----------------------------------------------------------------------
+    # REPASSES RECEBIDOS (ANEXO V)
+    # -----------------------------------------------------------------------
+    st.divider()
+    st.subheader("Repasses Recebidos - ANEXO V")
+
+    if df_anexov.empty:
+        st.info("Importe dados de Repasses Recebidos (ANEXO V) para visualizar.")
+    else:
+        av1, av2 = st.columns(2)
+        meses_av = sorted(df_anexov["mes"].unique())
+        ms_av = av1.multiselect(
+            "Meses:", meses_av,
+            default=meses_av,
+            format_func=lambda x: MESES_NOMES[x - 1],
+            key="ms_av"
+        )
+        entidades_disp = sorted(df_anexov["entidade_repassadora"].dropna().unique())
+        entidade_sel = av2.multiselect(
+            "Entidade Repassadora:", entidades_disp,
+            default=entidades_disp,
+            key="entidade_av"
+        )
+
+        df_avf = df_anexov[
+            df_anexov["mes"].isin(ms_av) &
+            df_anexov["entidade_repassadora"].isin(entidade_sel)
+        ].copy()
+
+        if not df_avf.empty:
+            total_repasses = df_avf["valor"].sum()
+            ka1, ka2 = st.columns(2)
+            ka1.metric("Total Repassado", "R$ {:,.2f}".format(total_repasses))
+            ka2.metric("Quantidade de Repasses", str(len(df_avf)))
+
+            # Grafico por entidade repassadora
+            df_por_entidade = (
+                df_avf.groupby("entidade_repassadora")["valor"]
+                .sum()
+                .reset_index()
+                .sort_values("valor", ascending=False)
+            )
+            fig_av = go.Figure(go.Bar(
+                x=df_por_entidade["entidade_repassadora"],
+                y=df_por_entidade["valor"],
+                marker_color="#1565C0",
+                text=df_por_entidade["valor"].apply(
+                    lambda v: "R$ {:,.0f}".format(v)
+                ),
+                textposition="outside"
+            ))
+            fig_av.update_layout(
+                height=350,
+                margin=dict(l=0, r=0, t=30, b=0),
+                xaxis_tickangle=-30,
+                yaxis_title="Valor (R$)"
+            )
+            st.plotly_chart(fig_av, width='stretch')
+
+            st.dataframe(
+                df_avf[["mes", "data", "entidade_repassadora", "valor", "finalidade", "fundamento_legal"]]
+                .rename(columns={
+                    "mes": "Mes",
+                    "data": "Data",
+                    "entidade_repassadora": "Entidade Repassadora",
+                    "valor": "Valor (R$)",
+                    "finalidade": "Finalidade",
+                    "fundamento_legal": "Fundamento Legal"
+                })
+                .style.format({"Valor (R$)": "{:,.2f}"}),
                 width='stretch'
             )
+        else:
+            st.info("Nenhum dado para os filtros selecionados.")
 
 
 # ---------------------------------------------------------------------------
 # ABA 2: DESPESAS
-# Cred. Autorizado: vem da tabela orcamento (FIP 616)
-# Empenhado/Liquidado/Pago: vem da tabela execucao (FIP 613, mensal direto)
 # ---------------------------------------------------------------------------
 with tab2:
     has_orc  = not df_orc.empty
@@ -992,7 +1636,6 @@ with tab2:
         nats_disp = sorted(df_exec["natureza"].dropna().unique().tolist()) if has_exec else []
         bd = st.multiselect("Natureza:", nats_disp, key="busca_d")
 
-        # Aplica filtros sobre execucao
         df_ef = df_exec[df_exec["mes"].isin(ms_d)].copy() if has_exec else pd.DataFrame()
         if ug_sel and not df_ef.empty:
             df_ef = df_ef[df_ef["ug"].isin(ug_sel)]
@@ -1007,58 +1650,113 @@ with tab2:
         if bd and not df_ef.empty:
             df_ef = df_ef[df_ef["natureza"].isin(bd)]
 
-        # KPIs
         m_max_orc = int(df_orc["mes"].max()) if has_orc else 0
         m_max_sel = max(ms_d) if ms_d else m_max_orc
 
-        # Cred. Autorizado: sempre do ultimo mes disponivel no orcamento
         cred_total = (
             df_orc[df_orc["mes"] == m_max_orc]["cred_autorizado"].sum()
             if has_orc else 0
         )
 
-        emp_total = df_ef["empenhado"].sum() if not df_ef.empty else 0
-        liq_total = df_ef["liquidado"].sum() if not df_ef.empty else 0
-        pag_total = df_ef["pago"].sum()      if not df_ef.empty else 0
+        emp_total = float(df_ef["empenhado"].sum()) if not df_ef.empty else 0
+        liq_total = float(df_ef["liquidado"].sum()) if not df_ef.empty else 0
+        pag_total = float(df_ef["pago"].sum())      if not df_ef.empty else 0
+        cred_total = float(cred_total)
+
+        pct_emp = emp_total / cred_total * 100 if cred_total > 0 else 0
+        pct_liq = liq_total / cred_total * 100 if cred_total > 0 else 0
+        pct_pag = pag_total / cred_total * 100 if cred_total > 0 else 0
 
         k1, k2, k3, k4 = st.columns(4)
         k1.metric(
-            "Cred. Autorizado (mes " + MESES_NOMES[m_max_orc - 1] + ")",
+            "Cred. Autorizado (" + (MESES_NOMES[m_max_orc - 1] if m_max_orc else "—") + ")",
             "R$ {:,.2f}".format(cred_total)
         )
-        k2.metric("Empenhado",  "R$ {:,.2f}".format(emp_total))
-        k3.metric("Liquidado",  "R$ {:,.2f}".format(liq_total))
-        k4.metric("Pago",       "R$ {:,.2f}".format(pag_total))
+        k2.metric("Empenhado",  "R$ {:,.2f}".format(emp_total),
+                  delta="{:.1f}% do cred.".format(pct_emp))
+        k3.metric("Liquidado",  "R$ {:,.2f}".format(liq_total),
+                  delta="{:.1f}% do cred.".format(pct_liq))
+        k4.metric("Pago",       "R$ {:,.2f}".format(pag_total),
+                  delta="{:.1f}% do cred.".format(pct_pag))
 
         if not df_ef.empty:
-            # Grafico mensal de execucao
-            df_g = (
-                df_ef.groupby("mes")[["empenhado", "liquidado", "pago"]]
-                .sum().reset_index()
-            )
+            df_g = (df_ef.groupby("mes")[["empenhado", "liquidado", "pago"]]
+                    .sum().reset_index())
             fig = go.Figure()
             fig.add_trace(go.Bar(
                 x=[MESES_NOMES[m - 1] for m in df_g["mes"]],
-                y=df_g["empenhado"], name="Empenhado", marker_color="#1565C0"
+                y=df_g["empenhado"], name="Empenhado", marker_color=COR_AZUL,
+                text=["{:.1f}%".format(v / cred_total * 100)
+                      if cred_total > 0 else "" for v in df_g["empenhado"]],
+                textposition="inside"
             ))
             fig.add_trace(go.Bar(
                 x=[MESES_NOMES[m - 1] for m in df_g["mes"]],
-                y=df_g["liquidado"], name="Liquidado", marker_color="#2E7D32"
+                y=df_g["liquidado"], name="Liquidado", marker_color=COR_VERDE,
+                text=["{:.1f}%".format(v / cred_total * 100)
+                      if cred_total > 0 else "" for v in df_g["liquidado"]],
+                textposition="inside"
             ))
             fig.add_trace(go.Bar(
                 x=[MESES_NOMES[m - 1] for m in df_g["mes"]],
-                y=df_g["pago"], name="Pago", marker_color="#E65100"
+                y=df_g["pago"], name="Pago", marker_color=COR_LARAN,
+                text=["{:.1f}%".format(v / cred_total * 100)
+                      if cred_total > 0 else "" for v in df_g["pago"]],
+                textposition="inside"
+            ))
+            # Linha de crédito autorizado
+            meses_labels = [MESES_NOMES[m - 1] for m in df_g["mes"]]
+            fig.add_trace(go.Scatter(
+                x=meses_labels, y=[cred_total] * len(meses_labels),
+                name="Cred. Autorizado", mode="lines",
+                line=dict(color="#B71C1C", width=2, dash="dash")
             ))
             fig.update_layout(
-                height=320, barmode="group",
-                margin=dict(l=0, r=0, t=30, b=0),
-                hovermode="x unified",
+                title="Despesas por Mês — % sobre Crédito Autorizado",
+                height=380, barmode="group",
+                margin=dict(l=0, r=0, t=40, b=0),
+                hovermode="x unified", plot_bgcolor="white",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                            xanchor="right", x=1)
+                            xanchor="right", x=1),
+                yaxis=dict(tickformat=",.0f", gridcolor="#F0F0F0")
             )
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
 
-            # Tabela agrupada
+            # Horizontal por natureza (top 20 por liquidado)
+            df_nat_agg = (df_ef.groupby("natureza")[["empenhado", "liquidado"]]
+                          .sum().reset_index()
+                          .sort_values("liquidado", ascending=True)
+                          .tail(20))
+            # Garantir que os rótulos do eixo Y sejam strings (evita escala numérica)
+            df_nat_agg["nat_label"] = df_nat_agg["natureza"].astype(str).str.strip()
+            tot_liq_nat = float(df_nat_agg["liquidado"].sum())
+            fig_nat = go.Figure()
+            fig_nat.add_trace(go.Bar(
+                y=df_nat_agg["nat_label"],
+                x=df_nat_agg["empenhado"], name="Empenhado",
+                orientation="h", marker_color=COR_AZUL, opacity=0.65
+            ))
+            fig_nat.add_trace(go.Bar(
+                y=df_nat_agg["nat_label"],
+                x=df_nat_agg["liquidado"], name="Liquidado",
+                orientation="h", marker_color=COR_VERDE,
+                text=["{:.1f}%".format(v / tot_liq_nat * 100)
+                      if tot_liq_nat > 0 else "" for v in df_nat_agg["liquidado"]],
+                textposition="auto"
+            ))
+            fig_nat.update_layout(
+                title="Liquidado por Natureza (Top 20) — % s/ Total Liquidado",
+                height=max(300, len(df_nat_agg) * 42),
+                barmode="group",
+                margin=dict(l=130, r=60, t=45, b=0),
+                plot_bgcolor="white",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                            xanchor="right", x=1),
+                xaxis=dict(tickformat=",.0f", gridcolor="#EEEEEE", rangemode="tozero"),
+                yaxis=dict(type="category", automargin=True, tickfont=dict(size=11))
+            )
+            st.plotly_chart(fig_nat, use_container_width=True)
+
             ug_filtrada = set(ug_sel) != set(ugs_disp)
             col_chave = (["ug"] if ug_filtrada else []) + [
                 "funcao", "subfuncao", "programa", "projeto", "fonte", "natureza"
@@ -1066,18 +1764,31 @@ with tab2:
             df_agg = df_ef.groupby(col_chave, as_index=False)[
                 ["empenhado", "liquidado", "pago"]
             ].sum()
-
             st.dataframe(
                 df_agg[col_chave + ["empenhado", "liquidado", "pago"]]
-                .style.format({
-                    "empenhado": "{:,.2f}",
-                    "liquidado": "{:,.2f}",
-                    "pago": "{:,.2f}"
-                }),
-                width='stretch'
+                .style.format({"empenhado": "{:,.2f}",
+                               "liquidado": "{:,.2f}", "pago": "{:,.2f}"}),
+                use_container_width=True
             )
 
-        # Sub-elementos (FIP 701) — valores mensais diretos, soma dos meses selecionados
+            st.divider()
+            filtros_str_d = " | ".join(filter(None, [
+                ("UGs: " + ", ".join(ug_sel)) if set(ug_sel) != set(ugs_disp) else "",
+                ("Meses: " + ", ".join(MESES_NOMES[m-1] for m in ms_d)) if ms_d else "",
+                ("Natureza: " + ", ".join(str(n) for n in bd)) if bd else "",
+            ])) or "Todos"
+            try:
+                pdf_bytes_d = gerar_pdf_despesas(df_ef, cred_total, ms_d, filtros_str_d)
+                st.download_button(
+                    "📄 Exportar Relatório PDF — Despesas",
+                    data=pdf_bytes_d,
+                    file_name="relatorio_despesas.pdf",
+                    mime="application/pdf",
+                    key="pdf_desp"
+                )
+            except Exception as e:
+                st.warning("PDF indisponível: " + str(e))
+
         if not df_sub.empty:
             st.divider()
             with st.expander("Sub-elementos por PAOE (FIP 701)"):
@@ -1104,7 +1815,6 @@ with tab2:
                 fonte_s = fs4.multiselect(
                     "Fonte:", fontes_sub, key="fonte_s"
                 )
-                # Sub-elemento: busca por codigo ou descricao, depois multiselect
                 sub_busca = fs5.text_input(
                     "Buscar sub-elemento (cod. ou desc.):",
                     key="sub_busca",
@@ -1121,33 +1831,17 @@ with tab2:
                 sub_sel = fs5.multiselect(
                     "Sub-elemento:", subs_disp, key="sub_sel"
                 )
-                # UG via Natureza: execucao(ug+natureza) -> sub_elementos(natureza_cod)
-                # extrai apenas os digitos iniciais do campo natureza da execucao
                 ugs_sub = (
-                    sorted(df_exec["ug"].dropna().unique().tolist())
-                    if not df_exec.empty else []
+                    sorted(df_sub["ug"].dropna().unique().tolist())
+                    if "ug" in df_sub.columns and not df_sub.empty else []
                 )
                 ug_sel_s = fs6.multiselect(
-                    "UG (via Natureza):", ugs_sub, key="ug_sub"
+                    "UG:", ugs_sub, key="ug_sub"
                 )
 
-                # Aplica filtros e soma todos os meses selecionados
                 df_sf = df_sub[df_sub["mes"].isin(ms_s)].copy()
-                # Filtro UG: UG -> naturezas na execucao -> natureza_cod no sub_elementos
-                if ug_sel_s and not df_exec.empty:
-                    nats_ug = df_exec[df_exec["ug"].isin(ug_sel_s)]["natureza"].dropna().unique()
-                    # extrai prefixo numerico (ex: "339030 - CONSUMO" -> "339030")
-                    nats_cod_ug = set(
-                        re.match(r"^(\d+)", str(n).strip()).group(1)
-                        for n in nats_ug
-                        if re.match(r"^(\d+)", str(n).strip())
-                    )
-                    df_sf = df_sf[
-                        df_sf["natureza_cod"].apply(
-                            lambda x: re.match(r"^(\d+)", str(x).strip()).group(1)
-                            if re.match(r"^(\d+)", str(x).strip()) else x
-                        ).isin(nats_cod_ug)
-                    ]
+                if ug_sel_s and "ug" in df_sf.columns:
+                    df_sf = df_sf[df_sf["ug"].isin(ug_sel_s)]
                 if paoe_s:
                     df_sf = df_sf[df_sf["paoe"].isin(paoe_s)]
                 if nat_s:
@@ -1159,30 +1853,102 @@ with tab2:
 
                 if not df_sf.empty:
                     has_fonte = "fonte" in df_sf.columns
-                    col_s = ["paoe", "natureza_cod", "natureza_desc"]
-                    if has_fonte:
-                        col_s += ["fonte"]
+                    has_ug    = "ug"    in df_sf.columns
+                    col_s = []
+                    if has_ug:    col_s += ["ug"]
+                    col_s += ["paoe", "natureza_cod", "natureza_desc"]
+                    if has_fonte: col_s += ["fonte"]
                     col_s += ["subelemento_cod", "subelemento_desc"]
 
                     df_sv = df_sf.groupby(col_s, as_index=False)[
-                        ["liquidado", "pago"]
-                    ].sum()
+                        ["liquidado", "pago"]].sum()
 
-                    ks1, ks2 = st.columns(2)
-                    ks1.metric(
-                        "Liquidado", "R$ {:,.2f}".format(df_sv["liquidado"].sum())
+                    liq_sel_701  = float(df_sv["liquidado"].sum())
+                    pago_sel_701 = float(df_sv["pago"].sum())
+                    liq_tot_701  = float(df_sub["liquidado"].sum())
+                    pago_tot_701 = float(df_sub["pago"].sum())
+                    pct_liq_701  = liq_sel_701 / liq_tot_701 * 100 if liq_tot_701 > 0 else 0
+                    pct_pag_701  = pago_sel_701 / pago_tot_701 * 100 if pago_tot_701 > 0 else 0
+
+                    ks1, ks2, ks3, ks4 = st.columns(4)
+                    ks1.metric("Liquidado (Filtro)",
+                               "R$ {:,.2f}".format(liq_sel_701))
+                    ks2.metric("% s/ Total Liquidado",
+                               "{:.1f}%".format(pct_liq_701))
+                    ks3.metric("Pago (Filtro)",
+                               "R$ {:,.2f}".format(pago_sel_701))
+                    ks4.metric("% s/ Total Pago",
+                               "{:.1f}%".format(pct_pag_701))
+
+                    # Gráfico horizontal por sub-elemento (top 20)
+                    df_sub_plot = (df_sv.groupby("subelemento_desc")["liquidado"]
+                                   .sum().reset_index()
+                                   .sort_values("liquidado", ascending=True).tail(20))
+                    tot_sp = float(df_sub_plot["liquidado"].sum())
+                    fig_701 = go.Figure(go.Bar(
+                        y=df_sub_plot["subelemento_desc"],
+                        x=df_sub_plot["liquidado"],
+                        orientation="h",
+                        marker_color=COR_AZUL,
+                        text=["{:.1f}%".format(v / tot_sp * 100)
+                              if tot_sp > 0 else "" for v in df_sub_plot["liquidado"]],
+                        textposition="outside"
+                    ))
+                    fig_701.update_layout(
+                        title="Liquidado por Sub-elemento (Top 20) — % s/ Total",
+                        height=max(350, len(df_sub_plot) * 32),
+                        margin=dict(l=0, r=80, t=40, b=0),
+                        plot_bgcolor="white",
+                        xaxis=dict(tickformat=",.0f", gridcolor="#F0F0F0")
                     )
-                    ks2.metric(
-                        "Pago", "R$ {:,.2f}".format(df_sv["pago"].sum())
+                    st.plotly_chart(fig_701, use_container_width=True)
+
+                    # Gráfico por natureza
+                    df_nat_701 = (df_sv.groupby(["natureza_cod", "natureza_desc"])["liquidado"]
+                                  .sum().reset_index()
+                                  .sort_values("liquidado", ascending=True))
+                    tot_nat_701 = float(df_nat_701["liquidado"].sum())
+                    fig_nat_701 = go.Figure(go.Bar(
+                        y=df_nat_701["natureza_desc"],
+                        x=df_nat_701["liquidado"],
+                        orientation="h",
+                        marker_color=COR_VERDE,
+                        text=["{:.1f}%".format(v / tot_nat_701 * 100)
+                              if tot_nat_701 > 0 else "" for v in df_nat_701["liquidado"]],
+                        textposition="outside"
+                    ))
+                    fig_nat_701.update_layout(
+                        title="Liquidado por Natureza de Despesa — % s/ Total",
+                        height=max(260, len(df_nat_701) * 40),
+                        margin=dict(l=0, r=80, t=40, b=0),
+                        plot_bgcolor="white",
+                        xaxis=dict(tickformat=",.0f", gridcolor="#F0F0F0")
                     )
+                    st.plotly_chart(fig_nat_701, use_container_width=True)
+
                     st.dataframe(
                         df_sv[col_s + ["liquidado", "pago"]]
-                        .style.format({
-                            "liquidado": "{:,.2f}",
-                            "pago": "{:,.2f}"
-                        }),
-                        width='stretch'
+                        .style.format({"liquidado": "{:,.2f}", "pago": "{:,.2f}"}),
+                        use_container_width=True
                     )
+
+                    st.divider()
+                    filtros_701 = " | ".join(filter(None, [
+                        ("UG: " + ", ".join(ug_sel_s)) if ug_sel_s else "",
+                        ("PAOE: " + ", ".join(paoe_s)) if paoe_s else "",
+                        ("Natureza: " + ", ".join(nat_s)) if nat_s else "",
+                    ])) or "Todos"
+                    try:
+                        pdf_701 = gerar_pdf_701(df_sv, df_sub, ms_s, filtros_701)
+                        st.download_button(
+                            "📄 Exportar Relatório PDF — Sub-elementos (FIP 701)",
+                            data=pdf_701,
+                            file_name="relatorio_701.pdf",
+                            mime="application/pdf",
+                            key="pdf_701"
+                        )
+                    except Exception as e:
+                        st.warning("PDF indisponível: " + str(e))
                 else:
                     st.info("Nenhum dado para os filtros selecionados.")
 
@@ -1252,6 +2018,25 @@ with tab3:
             height=400, barmode="group", margin=dict(l=0, r=0, t=30, b=0)
         )
         st.plotly_chart(fig_c, width='stretch')
+
+        v_orc_comp = float(
+            df_orc[df_orc["mes"] == int(df_orc["mes"].max())]["cred_autorizado"].sum()
+            if not df_orc.empty else 0
+        )
+        try:
+            pdf_comp = gerar_pdf_comparativo(
+                float(tr), float(te), float(tl), float(tp),
+                v_orc_comp, list(ms_c), df_rec, df_exec
+            )
+            st.download_button(
+                "📄 Exportar Relatório PDF — Comparativo",
+                data=pdf_comp,
+                file_name="relatorio_comparativo.pdf",
+                mime="application/pdf",
+                key="pdf_comp"
+            )
+        except Exception as e:
+            st.warning("PDF indisponível: " + str(e))
 
 
 # ---------------------------------------------------------------------------
