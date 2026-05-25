@@ -21,7 +21,7 @@ from reportlab.lib.enums import TA_CENTER
 DB_NAME = 'dados_gestao_integrada.db'
 st.set_page_config(page_title="FIPLAN - GESTAO INTEGRADA", layout="wide")
 st.markdown(
-    "<h2 style='text-align:center;margin-bottom:0'>UO 03601 - FUNAJURIS</h2>"
+    "<h2 style='text-align:center;margin-bottom:0'>UO 03101 - TJMT</h2>"
     "<p style='text-align:center;color:#888;margin-top:0'>"
     "Gestao Financeira Integrada - FIPLAN</p>",
     unsafe_allow_html=True
@@ -569,7 +569,7 @@ def _tabela_pdf(dados, col_w):
 
 def _header_pdf(elements, st1, st2, titulo, periodo, filtros):
     elements.append(Paragraph(
-        "UO 03601 — FUNAJURIS", st1))
+        "UO 03101 — TRIBUNAL DE JUSTIÇA DE MATO GROSSO", st1))
     elements.append(Paragraph(
         "Gestão Financeira Integrada — FIPLAN / 2026", st2))
     elements.append(HRFlowable(
@@ -1011,9 +1011,7 @@ with st.sidebar:
                     "DELETE FROM receitas WHERE ano=2026 AND mes=?", (m_final,)
                 )
                 conn.executemany(
-                    "INSERT INTO receitas
-                    (mes, ano, codigo_full, natureza, orcado, realizado, previsao, categoria)
-                    VALUES (?,?,?,?,?,?,?,?)", dados
+                    "INSERT INTO receitas VALUES (?,?,?,?,?,?,?,?)", dados
                 )
                 conn.commit()
                 st.success(
