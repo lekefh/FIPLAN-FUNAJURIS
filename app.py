@@ -19,7 +19,7 @@ from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
 from reportlab.lib.enums import TA_CENTER
 
 DB_NAME = 'dados_gestao_integrada.db'
-st.set_page_config(page_title="FIPLAN - FUNAJURIS", layout="wide")
+st.set_page_config(page_title="FIPLAN - GESTAO INTEGRADA", layout="wide")
 st.markdown(
     "<h2 style='text-align:center;margin-bottom:0'>UO 03601 - FUNAJURIS</h2>"
     "<p style='text-align:center;color:#888;margin-top:0'>"
@@ -1033,7 +1033,7 @@ with st.sidebar:
                 for _, row in df.iterrows():
                     try:
                         uo = norm(gc616(row, 1))
-                        if not uo or uo in ("nan", "") or uo != "3601":
+                        if not uo or uo in ("nan", "") or uo != "3101":
                             continue
                         ug        = norm(gc616(row, 2))
                         funcao    = norm(gc616(row, 3))
