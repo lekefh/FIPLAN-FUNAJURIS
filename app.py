@@ -50,6 +50,15 @@ BIMESTRES = {
     "6 Bimestre (Nov-Dez)": [11, 12]
 }
 
+BIMESTRE_NOME_COMPLETO = {
+    "1 Bimestre (Jan-Fev)": "JANEIRO E FEVEREIRO",
+    "2 Bimestre (Mar-Abr)": "MARÇO E ABRIL",
+    "3 Bimestre (Mai-Jun)": "MAIO E JUNHO",
+    "4 Bimestre (Jul-Ago)": "JULHO E AGOSTO",
+    "5 Bimestre (Set-Out)": "SETEMBRO E OUTUBRO",
+    "6 Bimestre (Nov-Dez)": "NOVEMBRO E DEZEMBRO"
+}
+
 st.markdown(
     "<style>[data-testid='stMetricValue']"
     "{font-size:1.4rem!important;font-weight:700}</style>",
@@ -214,18 +223,58 @@ def preparar_base_despesas_lrf(df_orc, df_exec, meses_bim, meses_ate_agora):
     return base
 
 
+def _codigo_funcional(v):
+    m = re.match(r"^\s*(\d+)", str(v))
+    return m.group(1) if m else str(v).strip()
+
+
+def _descricao_funcional(v):
+    m = re.match(r"^\s*\d+\s*[-–]\s*(.+)$", str(v))
+    return m.group(1).strip().title() if m else ""
+
+
 def preparar_base_funcional_lrf(df_orc, df_exec, meses_bim, meses_ate_agora):
+    cols_vazias = ["funcao", "subfuncao", "orcado_inicial", "cred_autorizado", "emp_no_bim", "emp_ate", "liq_no_bim", "liq_ate", "funcao_desc", "subfuncao_desc"]
     if df_orc.empty and df_exec.empty:
-        return pd.DataFrame(columns=["funcao", "subfuncao", "orcado_inicial", "cred_autorizado", "emp_no_bim", "emp_ate", "liq_no_bim", "liq_ate"])
-    meses_orc = sorted(set(df_orc["mes"].tolist()).intersection(set(meses_ate_agora))) if not df_orc.empty else []
+        return pd.DataFrame(columns=cols_vazias)
+
+    # Orcamento (FIP 616) grava funcao/subfuncao so como codigo (ex: "3");
+    # Execucao (FIP 613) grava "codigo - descricao" (ex: "2 - JUDICIARIA").
+    # Por isso o merge precisa ser feito pelo codigo numerico, nao pelo texto bruto,
+    # senao a mesma funcao/subfuncao vira duas linhas (uma so com dotacao, outra so com execucao).
+    descricoes = {}
+    for df_fonte in (df_orc, df_exec):
+        if df_fonte.empty:
+            continue
+        for col, tipo in (("funcao", "funcao"), ("subfuncao", "subfuncao")):
+            if col not in df_fonte.columns:
+                continue
+            for v in df_fonte[col].dropna().unique():
+                cod = _codigo_funcional(v)
+                desc = _descricao_funcional(v)
+                if desc and not descricoes.get((tipo, cod)):
+                    descricoes[(tipo, cod)] = desc
+
+    def _com_codigo(df_fonte):
+        if df_fonte.empty:
+            return df_fonte
+        df_c = df_fonte.copy()
+        df_c["funcao"] = df_c["funcao"].apply(_codigo_funcional)
+        df_c["subfuncao"] = df_c["subfuncao"].apply(_codigo_funcional)
+        return df_c
+
+    df_orc_c = _com_codigo(df_orc)
+    df_exec_c = _com_codigo(df_exec)
+
+    meses_orc = sorted(set(df_orc_c["mes"].tolist()).intersection(set(meses_ate_agora))) if not df_orc_c.empty else []
     m_ref = max(meses_orc) if meses_orc else max(meses_ate_agora)
-    if not df_orc.empty and m_ref in df_orc["mes"].values:
-        df_last = df_orc[df_orc["mes"] == m_ref].groupby(["funcao", "subfuncao"], as_index=False).agg({"orcado_inicial": "sum", "cred_autorizado": "sum"})
+    if not df_orc_c.empty and m_ref in df_orc_c["mes"].values:
+        df_last = df_orc_c[df_orc_c["mes"] == m_ref].groupby(["funcao", "subfuncao"], as_index=False).agg({"orcado_inicial": "sum", "cred_autorizado": "sum"})
     else:
         df_last = pd.DataFrame(columns=["funcao", "subfuncao", "orcado_inicial", "cred_autorizado"])
-    if not df_exec.empty:
-        df_bim = df_exec[df_exec["mes"].isin(meses_bim)].groupby(["funcao", "subfuncao"], as_index=False).agg({"empenhado": "sum", "liquidado": "sum"}).rename(columns={"empenhado": "emp_no_bim", "liquidado": "liq_no_bim"})
-        df_ate = df_exec[df_exec["mes"].isin(meses_ate_agora)].groupby(["funcao", "subfuncao"], as_index=False).agg({"empenhado": "sum", "liquidado": "sum"}).rename(columns={"empenhado": "emp_ate", "liquidado": "liq_ate"})
+    if not df_exec_c.empty:
+        df_bim = df_exec_c[df_exec_c["mes"].isin(meses_bim)].groupby(["funcao", "subfuncao"], as_index=False).agg({"empenhado": "sum", "liquidado": "sum"}).rename(columns={"empenhado": "emp_no_bim", "liquidado": "liq_no_bim"})
+        df_ate = df_exec_c[df_exec_c["mes"].isin(meses_ate_agora)].groupby(["funcao", "subfuncao"], as_index=False).agg({"empenhado": "sum", "liquidado": "sum"}).rename(columns={"empenhado": "emp_ate", "liquidado": "liq_ate"})
     else:
         df_bim = pd.DataFrame(columns=["funcao", "subfuncao", "emp_no_bim", "liq_no_bim"])
         df_ate = pd.DataFrame(columns=["funcao", "subfuncao", "emp_ate", "liq_ate"])
@@ -233,7 +282,10 @@ def preparar_base_funcional_lrf(df_orc, df_exec, meses_bim, meses_ate_agora):
         for col in ["funcao", "subfuncao"]:
             if col in df_.columns:
                 df_[col] = df_[col].astype(str)
-    return df_last.merge(df_bim, on=["funcao", "subfuncao"], how="outer").merge(df_ate, on=["funcao", "subfuncao"], how="outer").fillna(0)
+    base = df_last.merge(df_bim, on=["funcao", "subfuncao"], how="outer").merge(df_ate, on=["funcao", "subfuncao"], how="outer").fillna(0)
+    base["funcao_desc"] = base["funcao"].apply(lambda c: descricoes.get(("funcao", str(c)), ""))
+    base["subfuncao_desc"] = base["subfuncao"].apply(lambda c: descricoes.get(("subfuncao", str(c)), ""))
+    return base
 
 
 def gerar_excel_anexo1(df_rec, meses_bim, meses_ate_agora):
@@ -385,15 +437,26 @@ def gerar_excel_anexo2(df_orc, df_exec, meses_bim, meses_ate_agora):
     total_emp = float(base["emp_ate"].sum()) if not base.empty else 0.0
     total_liq = float(base["liq_ate"].sum()) if not base.empty else 0.0
     linhas = []
+
+    def _chave_num(cod):
+        try:
+            return (0, int(cod))
+        except (TypeError, ValueError):
+            return (1, str(cod))
+
     if not base.empty:
-        for funcao in sorted(base["funcao"].astype(str).unique()):
+        for funcao in sorted(base["funcao"].astype(str).unique(), key=_chave_num):
             df_f = base[base["funcao"].astype(str) == str(funcao)].copy()
+            desc_f = next((d for d in df_f["funcao_desc"] if d), "")
+            label_f = (desc_f.upper() + " - " + str(funcao)) if desc_f else ("FUNCAO " + str(funcao))
             vf = {"orcado_inicial": float(df_f["orcado_inicial"].sum()), "cred_autorizado": float(df_f["cred_autorizado"].sum()), "emp_no_bim": float(df_f["emp_no_bim"].sum()), "emp_ate": float(df_f["emp_ate"].sum()), "perc_emp": safe_div(float(df_f["emp_ate"].sum()), total_emp), "saldo_emp": float(df_f["cred_autorizado"].sum() - df_f["emp_ate"].sum()), "liq_no_bim": float(df_f["liq_no_bim"].sum()), "liq_ate": float(df_f["liq_ate"].sum()), "perc_liq": safe_div(float(df_f["liq_ate"].sum()), total_liq), "saldo_liq": float(df_f["cred_autorizado"].sum() - df_f["liq_ate"].sum()), "restos": 0.0}
-            linhas.append(("FUNCAO " + str(funcao), vf, "grupo"))
-            for subf in sorted(df_f["subfuncao"].astype(str).unique()):
+            linhas.append((label_f, vf, "grupo"))
+            for subf in sorted(df_f["subfuncao"].astype(str).unique(), key=_chave_num):
                 df_s = df_f[df_f["subfuncao"].astype(str) == str(subf)].copy()
+                desc_s = next((d for d in df_s["subfuncao_desc"] if d), "")
+                label_s = (desc_s + " - " + str(subf)) if desc_s else ("Subfuncao " + str(subf))
                 vs = {"orcado_inicial": float(df_s["orcado_inicial"].sum()), "cred_autorizado": float(df_s["cred_autorizado"].sum()), "emp_no_bim": float(df_s["emp_no_bim"].sum()), "emp_ate": float(df_s["emp_ate"].sum()), "perc_emp": safe_div(float(df_s["emp_ate"].sum()), total_emp), "saldo_emp": float(df_s["cred_autorizado"].sum() - df_s["emp_ate"].sum()), "liq_no_bim": float(df_s["liq_no_bim"].sum()), "liq_ate": float(df_s["liq_ate"].sum()), "perc_liq": safe_div(float(df_s["liq_ate"].sum()), total_liq), "saldo_liq": float(df_s["cred_autorizado"].sum() - df_s["liq_ate"].sum()), "restos": 0.0}
-                linhas.append(("Subfuncao " + str(subf), vs, "item"))
+                linhas.append((label_s, vs, "item"))
     vt = {"orcado_inicial": float(base["orcado_inicial"].sum()) if not base.empty else 0.0, "cred_autorizado": float(base["cred_autorizado"].sum()) if not base.empty else 0.0, "emp_no_bim": float(base["emp_no_bim"].sum()) if not base.empty else 0.0, "emp_ate": total_emp, "perc_emp": 1.0 if total_emp > 0 else 0.0, "saldo_emp": float(base["cred_autorizado"].sum() - base["emp_ate"].sum()) if not base.empty else 0.0, "liq_no_bim": float(base["liq_no_bim"].sum()) if not base.empty else 0.0, "liq_ate": total_liq, "perc_liq": 1.0 if total_liq > 0 else 0.0, "saldo_liq": float(base["cred_autorizado"].sum() - base["liq_ate"].sum()) if not base.empty else 0.0, "restos": 0.0}
     linhas.append(("TOTAL", vt, "total"))
     output = io.BytesIO()
@@ -1375,10 +1438,18 @@ with st.sidebar:
                         if m:
                             cur_nat_cod = m.group(1).strip()
                             raw = m.group(2).replace("\xa0", " ").strip()
-                            cur_nat_desc = (
-                                raw.split(" - ")[0].strip()
-                                if " - " in raw else raw
-                            )
+                            if " - " in raw:
+                                p1, p2 = (p.strip() for p in raw.split(" - ", 1))
+                                # O FIPLAN as vezes repete o nome sem acento apos o
+                                # travessao (ex: "...ANTERIORES - ...ANTERIORES");
+                                # so descarta a segunda parte quando for essa repeticao,
+                                # nomes de duas partes genuinos (ex: "- PESSOA FISICA") ficam intactos.
+                                cur_nat_desc = (
+                                    p1 if sem_acento(p1).upper() == sem_acento(p2).upper()
+                                    else raw
+                                )
+                            else:
+                                cur_nat_desc = raw
                         continue
 
                     if (tu.startswith("TOTAL") or tu.startswith("CONSOLID")
@@ -1586,23 +1657,44 @@ with st.sidebar:
     file_restore = st.file_uploader("Arquivo CSV", type=["csv"], key="file_rest")
     if file_restore and st.button("Restaurar"):
         df_res = pd.read_csv(file_restore)
-        # Garantir que só entra dados da UO 03601 (FUNAJURIS)
-        UO_PROJETO = "3601"
-        if "uo" in df_res.columns:
-            qtd_antes = len(df_res)
-            df_res = df_res[df_res["uo"].astype(str).str.lstrip("0") == UO_PROJETO.lstrip("0")]
-            filtradas = qtd_antes - len(df_res)
-            if filtradas > 0:
-                st.warning(
-                    f"{filtradas} linha(s) de outras UOs removidas — "
-                    f"apenas UO {UO_PROJETO} (FUNAJURIS) foi mantida."
-                )
-        conn_r = sqlite3.connect(DB_NAME)
-        df_res.to_sql(tabela_rest, conn_r, if_exists="replace", index=False)
-        conn_r.commit()
-        conn_r.close()
-        st.success(f"Tabela '{tabela_rest}' restaurada! ({len(df_res)} linhas)")
-        st.rerun()
+
+        # Valida se o CSV enviado realmente pertence a tabela selecionada,
+        # comparando com o schema atual da tabela no banco. Evita substituir
+        # (to_sql replace) uma tabela pelo backup de outra por engano.
+        colunas_esperadas = set(tbls[tabela_rest].columns)
+        colunas_arquivo = set(df_res.columns)
+        faltando = colunas_esperadas - colunas_arquivo
+        sobrando = colunas_arquivo - colunas_esperadas
+
+        if faltando or sobrando:
+            msg = f"Arquivo incompativel com a tabela '{tabela_rest}'."
+            if faltando:
+                msg += f" Faltam as colunas: {', '.join(sorted(faltando))}."
+            if sobrando:
+                msg += f" Colunas inesperadas no arquivo: {', '.join(sorted(sobrando))}."
+            msg += (
+                " Confira se o CSV escolhido corresponde a tabela selecionada "
+                "(ex.: nao envie backup_execucao.csv com 'orcamento' selecionado)."
+            )
+            st.error(msg)
+        else:
+            # Garantir que só entra dados da UO 03601 (FUNAJURIS)
+            UO_PROJETO = "3601"
+            if "uo" in df_res.columns:
+                qtd_antes = len(df_res)
+                df_res = df_res[df_res["uo"].astype(str).str.lstrip("0") == UO_PROJETO.lstrip("0")]
+                filtradas = qtd_antes - len(df_res)
+                if filtradas > 0:
+                    st.warning(
+                        f"{filtradas} linha(s) de outras UOs removidas — "
+                        f"apenas UO {UO_PROJETO} (FUNAJURIS) foi mantida."
+                    )
+            conn_r = sqlite3.connect(DB_NAME)
+            df_res.to_sql(tabela_rest, conn_r, if_exists="replace", index=False)
+            conn_r.commit()
+            conn_r.close()
+            st.success(f"Tabela '{tabela_rest}' restaurada! ({len(df_res)} linhas)")
+            st.rerun()
 
     st.divider()
     st.subheader("Limpeza Geral")
@@ -2331,6 +2423,24 @@ with tab4:
         meses_bim = BIMESTRES[bim]
         meses_ate_agora = list(range(1, max(meses_bim) + 1))
 
+        def _ano_do_bimestre(meses):
+            anos = []
+            for df_ in (df_rec, df_orc, df_exec, df_rp):
+                if not df_.empty and "ano" in df_.columns and "mes" in df_.columns:
+                    sel = df_[df_["mes"].isin(meses)]
+                    if not sel.empty:
+                        anos.extend(sel["ano"].dropna().unique().tolist())
+            if anos:
+                return int(max(anos))
+            for df_ in (df_rec, df_orc, df_exec, df_rp):
+                if not df_.empty and "ano" in df_.columns and not df_["ano"].isnull().all():
+                    return int(df_["ano"].max())
+            return 2026
+
+        nome_bim = BIMESTRE_NOME_COMPLETO[bim]
+        ano_lrf = _ano_do_bimestre(meses_bim)
+        sufixo_bim = nome_bim + "_" + str(ano_lrf)
+
         c1, c2, c3 = st.columns(3)
 
         c1.write("**Anexo I — Receitas**")
@@ -2338,7 +2448,7 @@ with tab4:
         c1.download_button(
             "Baixar Anexo I (.xlsx)",
             data=gerar_excel_anexo1(df_rec, meses_bim, meses_ate_agora),
-            file_name="AnexoI_LRF.xlsx",
+            file_name="1-LRF-INCISO_I_Alíneas_a e b_" + sufixo_bim + "_ANEXO I - Funajuris.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="lrf1"
         )
@@ -2348,7 +2458,7 @@ with tab4:
         c2.download_button(
             "Baixar Anexo IA (.xlsx)",
             data=gerar_excel_anexo1a(df_orc, df_exec, df_rec, meses_bim, meses_ate_agora),
-            file_name="AnexoIA_LRF.xlsx",
+            file_name="2-LRF-INCISO_II_Alíneas_a e b_" + sufixo_bim + "_Despesas_" + str(ano_lrf) + "_ANEXO I A - Funajuris.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="lrf1a"
         )
@@ -2358,7 +2468,7 @@ with tab4:
         c3.download_button(
             "Baixar Anexo II (.xlsx)",
             data=gerar_excel_anexo2(df_orc, df_exec, meses_bim, meses_ate_agora),
-            file_name="AnexoII_LRF.xlsx",
+            file_name="3-LRF-INCISO_II_Alínea_c_" + sufixo_bim + "_ANEXO II - Funajuris.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="lrf2"
         )
@@ -2371,7 +2481,7 @@ with tab4:
             c4.download_button(
                 "Baixar Anexo RP (.xlsx)",
                 data=gerar_excel_rp(df_rp, meses_bim, meses_ate_agora),
-                file_name="AnexoRP_LRF.xlsx",
+                file_name="4-LRF_Inciso_V_" + sufixo_bim + "_ANEXO VII - Funajuris.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="lrf_rp"
             )
