@@ -83,6 +83,14 @@ def detectar_mes(arquivo):
         for r in range(len(df_scan)):
             for celula in df_scan.iloc[r]:
                 txt = sem_acento(str(celula)).upper()
+                # Todos os relatorios FIPLAN (729, 616, 613, 226, 701...) trazem o
+                # mes no cabecalho como "*Mes de Referencia igual a N" (numero, nao
+                # por extenso) -- essa e a fonte confiavel do mes do arquivo.
+                m_ref = re.search(r"MES\s+DE\s+REFERENCIA[^\d]*(\d{1,2})", txt)
+                if m_ref:
+                    num = int(m_ref.group(1))
+                    if 1 <= num <= 12:
+                        return num
                 for nome, num in MESES_SEM_ACENTO.items():
                     if nome in txt:
                         m_final = num
