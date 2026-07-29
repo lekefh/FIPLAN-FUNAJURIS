@@ -316,8 +316,13 @@ def gerar_excel_anexo1(df_rec, meses_bim, meses_ate_agora):
         worksheet.write(1, 5, "ATE O BIMESTRE\n" + periodo, f["fmt_header"])
         worksheet.write(1, 6, "%\n(C/A)", f["fmt_header"])
         worksheet.write(1, 7, "SALDO A\nREALIZAR\n(A-C)", f["fmt_header"])
-        ordem_categorias = ["Receita Tributaria", "Receita Patrimonial", "Receita de Servicos", "Receita Corrente", "Demais Receitas"]
-        grupos = {"RECEITAS CORRENTES": ["Receita Tributaria", "Receita Patrimonial", "Receita de Servicos", "Receita Corrente"], "DEMAIS RECEITAS CORRENTES": ["Demais Receitas"]}
+        # "Nao Classificada" entra no grupo "Demais Receitas Correntes" para que
+        # nenhuma receita realizada fique de fora do total so por falta de
+        # categorizacao manual (codigo novo que ainda nao foi classificado na
+        # aba Receitas). Fica visivel como subgrupo proprio para o usuario notar
+        # e classificar depois.
+        ordem_categorias = ["Receita Tributaria", "Receita Patrimonial", "Receita de Servicos", "Receita Corrente", "Demais Receitas", "Nao Classificada"]
+        grupos = {"RECEITAS CORRENTES": ["Receita Tributaria", "Receita Patrimonial", "Receita de Servicos", "Receita Corrente"], "DEMAIS RECEITAS CORRENTES": ["Demais Receitas", "Nao Classificada"]}
         row = 2
         def write_row(desc, vals, fd, fn, fp):
             nonlocal row
@@ -1269,7 +1274,7 @@ with st.sidebar:
             # RECEITA (FIP 729)
             # ----------------------------------------------------------------
             if tipo_dado == "Receita (FIP 729)":
-                df = pd.read_excel(arquivo, skiprows=7, header=0)
+                df = pd.read_excel(arquivo, skiprows=5, header=0)
                 dados = []
                 for _, row in df.iterrows():
                     try:
